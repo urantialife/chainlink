@@ -715,3 +715,91 @@ func TestHeadTracker_GetChainWithBackfill(t *testing.T) {
 		ethClient.AssertExpectations(t)
 	})
 }
+
+type blockingCallback struct {
+	called chan models.Head
+	resume chan bool
+}
+
+func (c *blockingCallback) Connect(bn *models.Head) error {
+	return nil
+}
+
+func (c *blockingCallback) Disconnect() {
+	return
+}
+
+// OnNewLongestChain increases the OnNewLongestChainCount count by one
+func (c *blockingCallback) OnNewLongestChain(h models.Head) {
+	c.called <- h
+	<-c.resume
+}
+
+func TestHeadTracker_RingBuffer(t *testing.T) {
+	t.Run("drops excess heads if we can't process them fast enough", func(t *testing.T) {
+		t.Parallel()
+		// g := gomega.NewGomegaWithT(t)
+
+		store, cleanup := cltest.NewStore(t)
+		defer cleanup()
+
+		sub := new(mocks.Subscription)
+		ethClient := new(mocks.Client)
+		store.EthClient = ethClient
+
+		chchHeaders := make(chan chan<- *models.Head, 1)
+		ethClient.On("ChainID", mock.Anything).Return(store.Config.ChainID(), nil)
+		ethClient.On("SubscribeNewHead", mock.Anything, mock.Anything).
+			Run(func(args mock.Arguments) {
+				chchHeaders <- args.Get(1).(chan<- *models.Head)
+			}).
+			Return(sub, nil)
+		// We don't care about this since we're not testing backfilling, just return anything
+		ethClient.On("HeaderByNumber", mock.Anything, mock.Anything).Return(cltest.Head(42), nil)
+
+		sub.On("Unsubscribe").Return()
+		sub.On("Err").Return(nil)
+
+		called := make(chan models.Head)
+		resume := make(chan bool)
+		cb := &blockingCallback{
+			called: called,
+			resume: resume,
+		}
+		ht := services.NewHeadTracker(store, []strpkg.HeadTrackable{cb}, cltest.NeverSleeper{})
+		require.NoError(t, ht.Start())
+		headers := <-chchHeaders
+
+		// Fill up the buffer first
+		var i int64
+		for i = 0; i < services.HeadsBufferSize; i++ {
+			headers <- &models.Head{Number: i, Hash: cltest.NewHash()}
+		}
+		// Now we have heads 0, 1, 2 in buffer. Wait for callback to block on head 0
+		h := <-cb.called
+		require.Equal(t, int64(0), h.Number)
+
+		// Add heads 3 and 4 to the buffer. Head 1 should be dropped
+		headers <- &models.Head{Number: 3, Hash: cltest.NewHash()}
+		headers <- &models.Head{Number: 4, Hash: cltest.NewHash()}
+
+		// Resume the headtracker callback
+		cb.resume <- true
+
+		// Next head to be pulled off ought to be 2
+		h = <-cb.called
+		require.Equal(t, int64(2), h.Number)
+		cb.resume <- true
+
+		// 3, 4
+		h = <-cb.called
+		require.Equal(t, int64(3), h.Number)
+		cb.resume <- true
+		h = <-cb.called
+		require.Equal(t, int64(4), h.Number)
+		cb.resume <- true
+
+		// Headers channel now empty
+		require.Len(t, headers, 0)
+	})
+}

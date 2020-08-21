@@ -48,17 +48,68 @@ var (
 )
 
 const (
-	// The size of the buffer for the headers channel. Note that callback
-	// execution is synchronous and could take a non-trivial amount of time.
-	headsBufferSize = 5
+	// The size of the buffer for the headers channel. This number controls
+	// how many heads we will buffer before dropping. Setting this to a number
+	// greater than 0 allows some short periods of overload at the expense of
+	// lagging processing.
+	HeadsBufferSize = 3
 )
+
+type headRingBuffer struct {
+	in    <-chan *models.Head
+	out   chan *models.Head
+	start sync.Once
+}
+
+func newHeadRingBuffer(in <-chan *models.Head, out chan *models.Head) *headRingBuffer {
+	return &headRingBuffer{
+		in:    in,
+		out:   out,
+		start: sync.Once{},
+	}
+}
+
+func (r *headRingBuffer) Start() {
+	r.start.Do(func() {
+		go r.run()
+	})
+}
+
+func (r *headRingBuffer) run() {
+	for h := range r.in {
+		promNumHeadsReceived.Inc()
+		hInQueue := len(r.out)
+		promHeadsInQueue.Set(float64(hInQueue))
+		if hInQueue > 0 && h != nil {
+			logger.Warnf("HeadTracker: Head %v is lagging behind, there are %v more heads in the queue. Your node is operating close to its maximum capacity and may start to miss jobs.", h.Number, hInQueue)
+		}
+		select {
+		case r.out <- h:
+		default:
+			// Need to select/default here because it's conceivable (although
+			// improbable) that between the previous select and now, all heads were drained
+			// from r.out by another goroutine
+			select {
+			case dropped := <-r.out:
+				if dropped != nil {
+					logger.Errorf("HeadTracker: dropping head %v with hash 0x%x because queue is full. WARNING: Your node is overloaded and may start missing jobs.", dropped.Number, h.Hash)
+				}
+				r.out <- h
+			default:
+				r.out <- h
+			}
+		}
+	}
+	close(r.out)
+}
 
 // HeadTracker holds and stores the latest block number experienced by this particular node
 // in a thread safe manner. Reconstitutes the last block number from the data
 // store on reboot.
 type HeadTracker struct {
 	callbacks             []strpkg.HeadTrackable
-	headers               chan *models.Head
+	inHeaders             chan *models.Head
+	outHeaders            chan *models.Head
 	headSubscription      ethereum.Subscription
 	highestSeenHead       *models.Head
 	store                 *strpkg.Store
@@ -236,14 +287,12 @@ func (ht *HeadTracker) receiveHeaders() error {
 		select {
 		case <-ht.done:
 			return nil
-		case blockHeader, open := <-ht.headers:
-			promNumHeadsReceived.Inc()
-			promHeadsInQueue.Set(float64(len(ht.headers)))
+		case blockHeader, open := <-ht.outHeaders:
 			if !open {
-				return errors.New("HeadTracker headers prematurely closed")
+				return errors.New("HeadTracker: outHeaders prematurely closed")
 			}
 			if blockHeader == nil {
-				logger.Warn("got nil block header")
+				logger.Warn("HeadTracker: got nil block header")
 				continue
 			}
 			if err := ht.handleNewHead(*blockHeader); err != nil {
@@ -459,8 +508,13 @@ func (ht *HeadTracker) subscribeToHead() error {
 	ht.headMutex.Lock()
 	defer ht.headMutex.Unlock()
 
-	ht.headers = make(chan *models.Head, headsBufferSize)
-	sub, err := ht.store.EthClient.SubscribeNewHead(context.Background(), ht.headers)
+	ht.inHeaders = make(chan *models.Head)
+	ht.outHeaders = make(chan *models.Head, HeadsBufferSize)
+	rb := newHeadRingBuffer(ht.inHeaders, ht.outHeaders)
+	// It will autostop when we close inHeaders channel
+	rb.Start()
+
+	sub, err := ht.store.EthClient.SubscribeNewHead(context.Background(), ht.inHeaders)
 	if err != nil {
 		return errors.Wrap(err, "EthClient#SubscribeNewHead")
 	}
@@ -488,7 +542,9 @@ func (ht *HeadTracker) unsubscribeFromHead() error {
 
 	ht.connected = false
 	ht.disconnect()
-	close(ht.headers)
+	close(ht.inHeaders)
+	// Wait for ringbuffer to close the outgoing channel
+	<-ht.outHeaders
 	return nil
 }
 
